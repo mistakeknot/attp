@@ -1,0 +1,897 @@
+# attp MCP Tool Definitions
+# 16 tools across 5 groups: Discovery, Token Lifecycle, Content Transfer, Verification, Session Management
+#
+# Design principles:
+#   - Framework-agnostic: no Demarch/interweave/Tailscale references in names or params
+#   - Idempotency documented per tool
+#   - Atomic tools composable by higher layers
+#   - Error shape follows toolerror convention: {type, message, recoverable, data}
+
+version: "1.0"
+
+# ---------------------------------------------------------------------------
+# Error Taxonomy
+# ---------------------------------------------------------------------------
+errors:
+  shape:
+    type: string          # error type constant from the list below
+    message: string       # human-readable explanation
+    recoverable: boolean  # whether the caller should retry
+    data: object          # optional structured context (peer_id, retry_after_seconds, etc.)
+
+  types:
+    - type: VALIDATION
+      recoverable: false
+      http_analog: 400
+      description: Malformed request, missing required fields, invalid enum value.
+
+    - type: PEER_UNAVAILABLE
+      recoverable: true
+      http_analog: 503
+      description: Peer is offline or unreachable; retry after backoff.
+
+    - type: PEER_NOT_FOUND
+      recoverable: false
+      http_analog: 404
+      description: No peer with that ID exists in the mesh.
+
+    - type: PEER_REJECTED
+      recoverable: false
+      http_analog: 403
+      description: Peer explicitly rejected the request (e.g., blocklisted sender).
+
+    - type: SESSION_NOT_FOUND
+      recoverable: false
+      http_analog: 404
+      description: No session with that ID exists.
+
+    - type: SESSION_ENDED
+      recoverable: false
+      http_analog: 410
+      description: Session existed but has been ended or expired; create a new one.
+
+    - type: TOKEN_NOT_FOUND
+      recoverable: false
+      http_analog: 404
+      description: No token with that ID exists.
+
+    - type: TOKEN_INVALID
+      recoverable: false
+      http_analog: 422
+      description: Token payload failed structural validation (missing fields, bad types).
+
+    - type: CONTENT_EXCLUDED
+      recoverable: false
+      http_analog: 403
+      description: Requested content is excluded by the sender's sensitivity policy.
+
+    - type: CONTENT_NOT_FOUND
+      recoverable: false
+      http_analog: 404
+      description: Content hash not found on the peer.
+
+    - type: VERIFICATION_FAILED
+      recoverable: false
+      http_analog: 422
+      description: Token or content failed integrity verification (Merkle root, signature, hash mismatch).
+
+    - type: VERSION_MISMATCH
+      recoverable: false
+      http_analog: 409
+      description: Peer runs an incompatible protocol version.
+
+    - type: CAPABILITY_MISSING
+      recoverable: false
+      http_analog: 501
+      description: Peer does not support a required feature.
+
+    - type: POLICY_VIOLATION
+      recoverable: false
+      http_analog: 403
+      description: Request violates the local sensitivity policy.
+
+    - type: RATE_LIMITED
+      recoverable: true
+      http_analog: 429
+      description: Too many requests; retry after retry_after_seconds in data.
+
+    - type: CONFIRMATION_REQUIRED
+      recoverable: true
+      http_analog: 428
+      description: Operation requires explicit user confirmation before proceeding.
+
+    - type: INTERNAL_ERROR
+      recoverable: false
+      http_analog: 500
+      description: Unexpected server error, not safe to retry.
+
+  recovery_matrix:
+    retry_with_backoff:
+      types: [PEER_UNAVAILABLE, RATE_LIMITED]
+      action: Wait retry_after_seconds (or exponential backoff), then retry same call.
+    fix_input_retry:
+      types: [VALIDATION, TOKEN_INVALID]
+      action: Correct the request parameters, then retry.
+    create_new_resource:
+      types: [SESSION_ENDED]
+      action: Create a new session with create_session, then retry the original operation.
+    negotiate_capability:
+      types: [VERSION_MISMATCH, CAPABILITY_MISSING]
+      action: Call peer_capabilities to discover what the peer supports, then adapt.
+    confirm_and_retry:
+      types: [CONFIRMATION_REQUIRED]
+      action: Present the confirmation prompt to the user, then retry with confirmation token.
+    do_not_retry:
+      types: [PEER_NOT_FOUND, PEER_REJECTED, SESSION_NOT_FOUND, TOKEN_NOT_FOUND, CONTENT_NOT_FOUND, CONTENT_EXCLUDED, POLICY_VIOLATION, VERIFICATION_FAILED, INTERNAL_ERROR]
+      action: Surface to the user or orchestrating layer. These indicate fundamental problems.
+
+# ---------------------------------------------------------------------------
+# Group 1: Discovery
+# ---------------------------------------------------------------------------
+tools:
+
+  # --- Discovery (3 tools) ---
+
+  - name: list_peers
+    group: discovery
+    description: List known peers and their online status.
+    idempotent: true
+    request:
+      params: {}
+    response:
+      schema:
+        peers:
+          type: array
+          items:
+            type: object
+            properties:
+              peer_id:
+                type: string
+                description: Unique peer identifier.
+              display_name:
+                type: string
+                description: Human-readable peer name.
+              endpoint:
+                type: string
+                description: Opaque transport endpoint (format depends on transport layer).
+              status:
+                type: string
+                enum: [online, offline, unknown]
+              protocol_version:
+                type: string
+                description: Peer's protocol version (semver).
+              last_seen:
+                type: string
+                format: date-time
+              active_session:
+                type: string
+                description: Session ID if peer has an active session, null otherwise.
+    errors: [INTERNAL_ERROR]
+
+  - name: peer_capabilities
+    group: discovery
+    description: Query a peer's protocol version and feature flags.
+    idempotent: true
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: Peer identifier to query.
+    response:
+      schema:
+        peer_id:
+          type: string
+        protocol_version:
+          type: string
+        features:
+          type: array
+          items:
+            type: string
+          description: >
+            Feature flags the peer supports. v1.0 flags include:
+            merkle_exclusion_v1, lazy_fetch, incremental_tree,
+            content_types:X,Y (comma-separated content types).
+        max_token_bytes:
+          type: integer
+          description: Maximum token payload size the peer accepts.
+        supported_hash_algorithms:
+          type: array
+          items:
+            type: string
+          description: Hash algorithms the peer supports (e.g., sha256, blake3).
+        status:
+          type: string
+          enum: [online, offline, unknown]
+    errors: [PEER_NOT_FOUND, PEER_UNAVAILABLE, INTERNAL_ERROR]
+
+  - name: announce
+    group: discovery
+    description: >
+      Register or update this server's identity and capabilities in the peer mesh.
+      Servers call this on startup and periodically as a heartbeat.
+    idempotent: true  # upsert semantics; repeated calls refresh heartbeat TTL
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: This server's peer identifier.
+        display_name:
+          type: string
+          required: false
+          description: Human-readable name for this peer.
+        endpoint:
+          type: string
+          required: true
+          description: Transport endpoint where this peer can be reached.
+        protocol_version:
+          type: string
+          required: true
+          description: Protocol version this server supports.
+        features:
+          type: array
+          items:
+            type: string
+          required: false
+          description: Feature flags this server supports.
+        metadata:
+          type: object
+          required: false
+          description: Arbitrary key-value metadata (repo, branch, etc.).
+    response:
+      schema:
+        peer_id:
+          type: string
+        announced:
+          type: boolean
+        ttl_seconds:
+          type: integer
+          description: Seconds until this announcement expires if not refreshed.
+    errors: [VALIDATION, INTERNAL_ERROR]
+
+  # --- Token Lifecycle (4 tools) ---
+
+  - name: push_token
+    group: token_lifecycle
+    description: >
+      Send a structured context token to a peer. This is the core operation of attp:
+      packaging repo state, decisions, requests, and selectively inlined content into
+      a verifiable token.
+    idempotent: false  # each call creates a new token
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: Target peer to send the token to.
+        session_id:
+          type: string
+          required: true
+          description: Collaboration session this token belongs to.
+        token:
+          type: object
+          required: true
+          description: >
+            The context token payload. Contains version, type, repo_state,
+            decisions, requests, inlined_content, and content_refs.
+            Full schema owned by token-schema spec.
+        merkle_root:
+          type: string
+          required: true
+          description: Hash of the repo Merkle tree root.
+        exclusion_proof:
+          type: object
+          required: true
+          description: >
+            Cryptographic attestation of excluded paths. Contains algorithm,
+            excluded_count, attestation, and excluded_patterns.
+    response:
+      schema:
+        token_id:
+          type: string
+          description: Server-assigned token identifier.
+        peer_id:
+          type: string
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [delivered, queued]
+          description: >
+            "delivered" if peer received it immediately,
+            "queued" if peer is offline and token was queued for later delivery.
+        delivered_at:
+          type: string
+          format: date-time
+          description: Present when status is "delivered".
+        queued_at:
+          type: string
+          format: date-time
+          description: Present when status is "queued".
+        size_bytes:
+          type: integer
+        ttl_seconds:
+          type: integer
+          description: Present when status is "queued"; seconds until queued token expires.
+    errors:
+      - PEER_UNAVAILABLE
+      - PEER_NOT_FOUND
+      - PEER_REJECTED
+      - SESSION_NOT_FOUND
+      - SESSION_ENDED
+      - TOKEN_INVALID
+      - POLICY_VIOLATION
+      - VERSION_MISMATCH
+      - CAPABILITY_MISSING
+      - RATE_LIMITED
+      - INTERNAL_ERROR
+
+  - name: pull_tokens
+    group: token_lifecycle
+    description: Fetch inbound tokens, optionally filtered by peer or session.
+    idempotent: true  # read-only with cursor-based pagination
+    request:
+      params:
+        session_id:
+          type: string
+          required: false
+          description: Filter tokens by session.
+        peer_id:
+          type: string
+          required: false
+          description: Filter tokens by sending peer.
+        since:
+          type: string
+          format: date-time
+          required: false
+          description: Only return tokens received after this timestamp.
+        cursor:
+          type: string
+          required: false
+          description: Pagination cursor from a previous response.
+        limit:
+          type: integer
+          required: false
+          default: 20
+          maximum: 100
+          description: Maximum number of tokens to return.
+        status_filter:
+          type: string
+          required: false
+          default: unacked
+          enum: [all, unacked, acked]
+          description: Filter by acknowledgment status.
+    response:
+      schema:
+        tokens:
+          type: array
+          items:
+            type: object
+            properties:
+              token_id:
+                type: string
+              from_peer:
+                type: string
+              session_id:
+                type: string
+              received_at:
+                type: string
+                format: date-time
+              acked:
+                type: boolean
+              token:
+                type: object
+                description: Full token payload.
+              merkle_root:
+                type: string
+              exclusion_proof:
+                type: object
+              verified:
+                type: boolean
+                description: Whether the server auto-verified this token on receipt.
+        next_cursor:
+          type: string
+          description: Cursor for the next page, null if no more results.
+        total_unacked:
+          type: integer
+          description: Total count of unacknowledged tokens (regardless of filters).
+    errors: [SESSION_NOT_FOUND, PEER_NOT_FOUND, VALIDATION, INTERNAL_ERROR]
+
+  - name: ack_token
+    group: token_lifecycle
+    description: >
+      Acknowledge receipt and processing of a token.
+      Re-acking with the same disposition is a no-op;
+      re-acking with a different disposition updates it.
+    idempotent: true
+    request:
+      params:
+        token_id:
+          type: string
+          required: true
+          description: Token to acknowledge.
+        disposition:
+          type: string
+          required: true
+          enum: [accepted, rejected, partial]
+          description: How the token was handled.
+        reason:
+          type: string
+          required: false
+          description: Free-form note back to the sender.
+    response:
+      schema:
+        token_id:
+          type: string
+        acked:
+          type: boolean
+        disposition:
+          type: string
+          enum: [accepted, rejected, partial]
+        acked_at:
+          type: string
+          format: date-time
+    errors: [TOKEN_NOT_FOUND, VALIDATION, INTERNAL_ERROR]
+
+  - name: token_status
+    group: token_lifecycle
+    description: Check delivery and acknowledgment status of a previously pushed token.
+    idempotent: true
+    request:
+      params:
+        token_id:
+          type: string
+          required: true
+          description: Token to check status of.
+    response:
+      schema:
+        token_id:
+          type: string
+        peer_id:
+          type: string
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [delivered, queued, acked, expired]
+        delivered_at:
+          type: string
+          format: date-time
+        acked_at:
+          type: string
+          format: date-time
+          description: Present only if status is "acked".
+        disposition:
+          type: string
+          enum: [accepted, rejected, partial]
+          description: Present only if status is "acked".
+        notes:
+          type: string
+          description: Free-form note from the acknowledging peer.
+    errors: [TOKEN_NOT_FOUND, INTERNAL_ERROR]
+
+  # --- Content Transfer (2 tools) ---
+
+  - name: fetch_content
+    group: content_transfer
+    description: >
+      Lazy-fetch a file or blob from a peer by its content hash.
+      The content hash comes from a token's content_refs.
+    idempotent: true  # content-addressed; same hash always returns same content
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: Peer that owns the content.
+        content_hash:
+          type: string
+          required: true
+          description: Content-addressed hash (e.g., "sha256:abcdef...").
+        session_id:
+          type: string
+          required: true
+          description: Session context for access control.
+    response:
+      schema:
+        content_hash:
+          type: string
+        path:
+          type: string
+          description: Original file path on the peer.
+        content:
+          type: string
+          description: File content (base64-encoded for binary, plain text for text files).
+        size_bytes:
+          type: integer
+        verified:
+          type: boolean
+          description: Whether the server verified the content hash after fetch.
+    errors:
+      - CONTENT_NOT_FOUND
+      - CONTENT_EXCLUDED
+      - PEER_UNAVAILABLE
+      - PEER_NOT_FOUND
+      - SESSION_NOT_FOUND
+      - SESSION_ENDED
+      - INTERNAL_ERROR
+
+  - name: list_available
+    group: content_transfer
+    description: List fetchable content references that a peer is willing to share in a session.
+    idempotent: true
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: Peer to list content from.
+        session_id:
+          type: string
+          required: true
+          description: Session context for access control.
+        path_prefix:
+          type: string
+          required: false
+          description: Filter results to paths starting with this prefix.
+        limit:
+          type: integer
+          required: false
+          default: 100
+          description: Maximum number of refs to return.
+    response:
+      schema:
+        peer_id:
+          type: string
+        refs:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+              content_hash:
+                type: string
+              size_bytes:
+                type: integer
+              modified_at:
+                type: string
+                format: date-time
+        excluded_count:
+          type: integer
+          description: Number of files excluded by sensitivity policy (not listed).
+        total_available:
+          type: integer
+          description: Total number of available refs (before limit applied).
+    errors:
+      - PEER_NOT_FOUND
+      - PEER_UNAVAILABLE
+      - SESSION_NOT_FOUND
+      - SESSION_ENDED
+      - INTERNAL_ERROR
+
+  # --- Verification (3 tools) ---
+
+  - name: verify_token
+    group: verification
+    description: >
+      Verify a token's integrity: Merkle root consistency, exclusion proof validity,
+      content hash correctness, and signature.
+    idempotent: true  # deterministic verification
+    request:
+      params:
+        token_id:
+          type: string
+          required: true
+          description: Token to verify (must have been received via pull_tokens).
+    response:
+      schema:
+        token_id:
+          type: string
+        valid:
+          type: boolean
+        checks:
+          type: object
+          description: Per-check results.
+          properties:
+            merkle_root:
+              type: string
+              enum: [pass, fail, skipped]
+            exclusion_proof:
+              type: string
+              enum: [pass, fail, skipped]
+            signature:
+              type: string
+              enum: [pass, fail, skipped]
+            content_hashes:
+              type: string
+              enum: [pass, fail, skipped]
+        failures:
+          type: array
+          description: Present only when valid is false.
+          items:
+            type: object
+            properties:
+              check:
+                type: string
+                description: Which check failed (merkle_root, exclusion_proof, signature, content_hashes).
+              detail:
+                type: string
+                description: Human-readable failure explanation.
+              severity:
+                type: string
+                enum: [error, warning]
+    errors: [TOKEN_NOT_FOUND, VERIFICATION_FAILED, INTERNAL_ERROR]
+
+  - name: verify_content
+    group: verification
+    description: Verify a fetched blob's integrity against its expected content hash.
+    idempotent: true  # pure function
+    request:
+      params:
+        content:
+          type: string
+          required: true
+          description: Content to verify (base64-encoded for binary, plain text for text).
+        expected_hash:
+          type: string
+          required: true
+          description: Expected content hash (e.g., "sha256:abcdef...").
+    response:
+      schema:
+        valid:
+          type: boolean
+        expected_hash:
+          type: string
+        computed_hash:
+          type: string
+          description: The hash computed from the provided content.
+        algorithm:
+          type: string
+          description: Hash algorithm used (e.g., sha256, blake3).
+    errors: [VALIDATION, INTERNAL_ERROR]
+
+  - name: exclusion_manifest
+    group: verification
+    description: >
+      Return this server's current exclusion manifest. Allows peers to understand
+      what the sender is withholding and why, without revealing the content itself.
+    idempotent: true  # read-only (may change between calls if policy is updated)
+    request:
+      params: {}
+    response:
+      schema:
+        patterns:
+          type: array
+          items:
+            type: object
+            properties:
+              pattern:
+                type: string
+                description: Glob pattern of excluded paths.
+              source:
+                type: string
+                enum: [gitignore, attpignore, policy_config, manual]
+                description: Where this exclusion rule originated.
+              reason:
+                type: string
+                description: Human-readable explanation.
+        excluded_file_count:
+          type: integer
+          description: Number of files currently matched by exclusion patterns.
+        total_file_count:
+          type: integer
+          description: Total files in the repo.
+        has_exclusions:
+          type: boolean
+        hash_algorithm:
+          type: string
+          description: Algorithm used for content hashing.
+    errors: [INTERNAL_ERROR]
+
+  # --- Session Management (4 tools) ---
+
+  - name: create_session
+    group: session_management
+    description: >
+      Establish a collaboration session with a peer. Sessions scope token exchange,
+      access control, and content sharing.
+    idempotent: false  # each call creates a new session
+    request:
+      params:
+        peer_id:
+          type: string
+          required: true
+          description: Peer to establish session with.
+        session_name:
+          type: string
+          required: false
+          description: Human-readable session name or purpose.
+        repo_identifier:
+          type: string
+          required: false
+          description: Shared repo name for session correlation (not a filesystem path).
+        ttl_hours:
+          type: integer
+          required: false
+          default: 24
+          maximum: 168
+          description: Session lifetime in hours (max 7 days).
+    response:
+      schema:
+        session_id:
+          type: string
+        peer_id:
+          type: string
+        repo_identifier:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [active, pending]
+    errors:
+      - PEER_NOT_FOUND
+      - PEER_UNAVAILABLE
+      - PEER_REJECTED
+      - VERSION_MISMATCH
+      - CAPABILITY_MISSING
+      - RATE_LIMITED
+      - INTERNAL_ERROR
+
+  - name: session_status
+    group: session_management
+    description: Get current session state, participants, token counts, and last activity.
+    idempotent: true
+    request:
+      params:
+        session_id:
+          type: string
+          required: true
+          description: Session to query.
+    response:
+      schema:
+        session_id:
+          type: string
+        peer_id:
+          type: string
+        repo_identifier:
+          type: string
+        status:
+          type: string
+          enum: [active, ended, expired]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        last_activity:
+          type: string
+          format: date-time
+        participants:
+          type: array
+          items:
+            type: string
+          description: Peer IDs participating in this session.
+        token_count:
+          type: integer
+          description: Total tokens exchanged in this session.
+        tokens_sent:
+          type: integer
+        tokens_received:
+          type: integer
+        tokens_unacked:
+          type: integer
+    errors: [SESSION_NOT_FOUND, INTERNAL_ERROR]
+
+  - name: end_session
+    group: session_management
+    description: >
+      Gracefully end a collaboration session. Ending an already-ended session
+      returns the same response (idempotent).
+    idempotent: true
+    request:
+      params:
+        session_id:
+          type: string
+          required: true
+          description: Session to end.
+        reason:
+          type: string
+          required: false
+          description: Why the session is ending.
+    response:
+      schema:
+        session_id:
+          type: string
+        status:
+          type: string
+          enum: [ended]
+        ended_at:
+          type: string
+          format: date-time
+        final_stats:
+          type: object
+          properties:
+            tokens_sent:
+              type: integer
+            tokens_received:
+              type: integer
+            duration_minutes:
+              type: integer
+    errors: [SESSION_NOT_FOUND, INTERNAL_ERROR]
+
+  - name: configure_policy
+    group: session_management
+    description: >
+      Set sensitivity policy for content sharing. Upsert semantics: omitted fields
+      retain their current value.
+    idempotent: true  # upsert semantics
+    request:
+      params:
+        session_id:
+          type: string
+          required: false
+          description: >
+            Scope policy to a specific session. If omitted, sets the server-wide default policy.
+        excluded_patterns:
+          type: array
+          items:
+            type: string
+          required: false
+          description: Glob patterns for paths to exclude from sharing.
+        sensitivity_sources:
+          type: array
+          items:
+            type: string
+          required: false
+          description: Where to read exclusion patterns from (e.g., gitignore, attpignore).
+        auto_inline_threshold_bytes:
+          type: integer
+          required: false
+          default: 4096
+          description: Files smaller than this (bytes) are auto-inlined in tokens.
+        allowed_content_types:
+          type: array
+          items:
+            type: string
+          required: false
+          description: Content types this server will include in tokens (diff, ast, file, tree).
+        max_token_bytes:
+          type: integer
+          required: false
+          default: 1048576
+          description: Maximum token payload size in bytes.
+    response:
+      schema:
+        updated:
+          type: boolean
+        effective_policy:
+          type: object
+          properties:
+            sensitivity_sources:
+              type: array
+              items:
+                type: string
+            excluded_patterns:
+              type: array
+              items:
+                type: string
+            auto_inline_threshold_bytes:
+              type: integer
+            allowed_content_types:
+              type: array
+              items:
+                type: string
+            max_token_bytes:
+              type: integer
+            total_excluded_patterns:
+              type: integer
+              description: Total count of effective exclusion patterns (from all sources).
+    errors: [SESSION_NOT_FOUND, VALIDATION, POLICY_VIOLATION, INTERNAL_ERROR]

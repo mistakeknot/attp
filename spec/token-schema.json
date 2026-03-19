@@ -1,0 +1,488 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://attp.dev/spec/token-schema.json",
+  "title": "attp Token",
+  "description": "Agent-to-Agent Transfer Protocol token format. A self-describing, versioned JSON envelope for cross-agent, cross-machine context transfer.",
+  "type": "object",
+  "required": [
+    "attp",
+    "id",
+    "created_at",
+    "provenance",
+    "repo",
+    "sensitivity",
+    "payloads"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "attp": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Protocol version as a major.minor string. Consumers MUST reject tokens with an unrecognized major version. Consumers MUST ignore unknown fields from newer minor versions."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^attp_[A-Za-z0-9]{20,}$",
+      "description": "Globally unique token identifier. Format: attp_ prefix followed by 20+ base62 characters."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp with timezone indicating when the token was assembled."
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "repo": {
+      "$ref": "#/$defs/repo"
+    },
+    "sensitivity": {
+      "$ref": "#/$defs/sensitivity"
+    },
+    "payloads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/payload"
+      },
+      "description": "Content items included in the token, each either inlined or referenced for lazy fetch. May be empty."
+    },
+    "requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/request"
+      },
+      "description": "Structured work requests from sender to receiver."
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      },
+      "description": "Decisions made by the sender that the receiver should be aware of."
+    },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Namespaced extension data. Keys use reverse-domain naming (e.g., 'demarch.interweave'). Consumers MUST ignore unknown extensions."
+    }
+  },
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "required": [
+        "origin",
+        "vector_clock",
+        "sequence"
+      ],
+      "additionalProperties": true,
+      "description": "Origin and chain-of-custody metadata for the token.",
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/origin"
+        },
+        "participants": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/participant"
+          },
+          "description": "Map of agent_id to participant metadata. Keys are agent identifiers that correspond to vector_clock entries."
+        },
+        "vector_clock": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "description": "Logical clock mapping agent_id to an integer counter. Enables causal ordering of tokens across multiple agents without synchronized wall clocks."
+        },
+        "chain": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/chain_entry"
+          },
+          "description": "Previous tokens in the conversation chain, in chronological order. Each entry is a summary, not the full token. Append-only; producers MAY truncate to the last 20 entries for long conversations."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonically increasing sequence number within a conversation. First token is 1. Enables ordering even if timestamps are clock-skewed."
+        }
+      }
+    },
+    "origin": {
+      "type": "object",
+      "required": [
+        "agent_id"
+      ],
+      "additionalProperties": true,
+      "description": "Identity of the agent that produced this token.",
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "description": "Agent name or type (e.g., 'claude-code', 'cursor', 'copilot'). Framework-agnostic."
+        },
+        "agent_version": {
+          "type": "string",
+          "description": "Version of the agent software."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Opaque session identifier from the agent runtime. Optional because some agents do not expose session IDs."
+        },
+        "machine": {
+          "$ref": "#/$defs/machine"
+        }
+      }
+    },
+    "machine": {
+      "type": "object",
+      "required": [
+        "hostname"
+      ],
+      "additionalProperties": true,
+      "description": "Machine identity metadata.",
+      "properties": {
+        "hostname": {
+          "type": "string",
+          "description": "Machine hostname. Always present as a human-readable identifier."
+        },
+        "tailscale_id": {
+          "type": "string",
+          "description": "Tailscale machine identity. Present when transport is Tailscale."
+        }
+      }
+    },
+    "participant": {
+      "type": "object",
+      "required": [
+        "role",
+        "vector_clock_index"
+      ],
+      "additionalProperties": true,
+      "description": "Metadata about a participant in the token exchange.",
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Role of the participant (e.g., 'author', 'reviewer', 'forwarder')."
+        },
+        "vector_clock_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The participant's current position in the vector clock at the time they last touched the token."
+        }
+      }
+    },
+    "chain_entry": {
+      "type": "object",
+      "required": [
+        "token_id",
+        "agent_id",
+        "machine",
+        "timestamp",
+        "action"
+      ],
+      "additionalProperties": true,
+      "description": "Summary of a previous token in the conversation chain.",
+      "properties": {
+        "token_id": {
+          "type": "string",
+          "description": "ID of the previous token."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "Agent that produced the previous token."
+        },
+        "machine": {
+          "type": "string",
+          "description": "Machine where the previous token was produced."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the previous token was produced."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "initiated",
+            "responded",
+            "forwarded"
+          ],
+          "description": "What the previous token represented."
+        }
+      }
+    },
+    "repo": {
+      "type": "object",
+      "required": [
+        "url",
+        "branch",
+        "commit",
+        "dirty_paths",
+        "merkle_root"
+      ],
+      "additionalProperties": true,
+      "description": "Repository state snapshot at the time the token was created.",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "Canonical repo URL. Used for identity, not cloning."
+        },
+        "branch": {
+          "type": "string",
+          "description": "Current branch name."
+        },
+        "commit": {
+          "type": "string",
+          "description": "Full commit SHA at token creation time."
+        },
+        "dirty_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Repo-relative paths with uncommitted changes. May be empty."
+        },
+        "merkle_root": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+:.+$",
+          "description": "Content-addressed root hash of the repo tree. Format: algorithm:hex (e.g., 'sha256:abcdef...')."
+        }
+      }
+    },
+    "sensitivity": {
+      "type": "object",
+      "required": [
+        "has_exclusions",
+        "excluded_paths",
+        "exclusion_attestation"
+      ],
+      "additionalProperties": true,
+      "description": "Exclusion manifest and cryptographic attestation. Declares what was left out of the token and why.",
+      "properties": {
+        "has_exclusions": {
+          "type": "boolean",
+          "description": "Whether any paths were excluded from the token. Quick check before inspecting excluded_paths."
+        },
+        "excluded_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Repo-relative paths that were excluded. Directories end with '/'. Empty array when has_exclusions is false."
+        },
+        "exclusion_attestation": {
+          "$ref": "#/$defs/exclusion_attestation"
+        }
+      }
+    },
+    "exclusion_attestation": {
+      "type": "object",
+      "required": [
+        "merkle_root",
+        "timestamp",
+        "nonce",
+        "signature"
+      ],
+      "additionalProperties": true,
+      "description": "Cryptographic proof that the listed paths were actually excluded from the token's content.",
+      "properties": {
+        "merkle_root": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+:.+$",
+          "description": "Root hash of the Merkle tree covering the full repo tree (including excluded paths). Format: algorithm:hex."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the attestation was generated."
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Random nonce to prevent replay of attestations across tokens."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Cryptographic signature over the attestation fields. Verification method depends on transport (e.g., Tailscale node key)."
+        }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "required": [
+        "mode",
+        "path"
+      ],
+      "discriminator": {
+        "propertyName": "mode"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/payload_inline"
+        },
+        {
+          "$ref": "#/$defs/payload_ref"
+        }
+      ],
+      "description": "A content item, discriminated by the mode field. Inline payloads carry content directly; ref payloads point to content for lazy fetch."
+    },
+    "payload_inline": {
+      "type": "object",
+      "required": [
+        "mode",
+        "path",
+        "content"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "inline"
+        },
+        "path": {
+          "type": "string",
+          "description": "Repo-relative file path."
+        },
+        "role": {
+          "type": "string",
+          "description": "Semantic role of the payload (e.g., 'source', 'config', 'test', 'doc'). Optional hint for consumers."
+        },
+        "content": {
+          "type": "string",
+          "description": "File content, UTF-8 encoded."
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME type or text/x-{lang} for source files."
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+:.+$",
+          "description": "Content hash in algorithm:hex format. Consumers SHOULD verify hash matches content."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Content size in bytes."
+        }
+      }
+    },
+    "payload_ref": {
+      "type": "object",
+      "required": [
+        "mode",
+        "path",
+        "fetch_via"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "ref"
+        },
+        "path": {
+          "type": "string",
+          "description": "Repo-relative file path."
+        },
+        "role": {
+          "type": "string",
+          "description": "Semantic role of the payload (e.g., 'source', 'config', 'test', 'doc'). Optional hint for consumers."
+        },
+        "fetch_via": {
+          "type": "object",
+          "required": [
+            "content_hash",
+            "size_bytes"
+          ],
+          "additionalProperties": true,
+          "description": "Fetch descriptor for lazy content retrieval.",
+          "properties": {
+            "content_hash": {
+              "type": "string",
+              "pattern": "^[a-z0-9]+:.+$",
+              "description": "Content hash in algorithm:hex format. Used as cache key and integrity check after fetch."
+            },
+            "size_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Content size in bytes. Allows the consumer to decide whether to fetch before committing."
+            },
+            "tool": {
+              "type": "string",
+              "description": "MCP tool name to call for lazy fetch (e.g., 'attp_fetch_file'). Defaults to 'attp_fetch_file' in v1."
+            }
+          }
+        },
+        "content_type": {
+          "type": "string",
+          "description": "MIME type or text/x-{lang} for source files."
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+:.+$",
+          "description": "Content hash in algorithm:hex format (same as fetch_via.content_hash, duplicated at top level for uniform access)."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Content size in bytes (same as fetch_via.size_bytes, duplicated at top level for uniform access)."
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "kind",
+        "summary"
+      ],
+      "additionalProperties": true,
+      "description": "A structured work request from sender to receiver.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file_content",
+            "interface_contract",
+            "decision",
+            "review",
+            "custom"
+          ],
+          "description": "Category of request."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Human-readable description of what is being requested."
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Request-specific parameters. Schema varies by kind."
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "required": [
+        "summary",
+        "decided_at"
+      ],
+      "additionalProperties": true,
+      "description": "A decision made by the sender that the receiver should know about.",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "description": "What was decided."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why this decision was made."
+        },
+        "decided_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the decision was made, in ISO 8601 format."
+        }
+      }
+    }
+  }
+}
