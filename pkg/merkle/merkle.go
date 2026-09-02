@@ -287,21 +287,11 @@ func BuildFromDir(root string, excludePatterns []string) (*Tree, error) {
 
 // BuildFromDirCached walks a directory with an optional file cache.
 func BuildFromDirCached(root string, excludePatterns []string, cache *FileCache) (*Tree, error) {
-	matchers, err := compilePatterns(excludePatterns)
+	excluder, err := NewExcluderForDir(root, excludePatterns)
 	if err != nil {
-		return nil, fmt.Errorf("compiling patterns: %w", err)
+		return nil, err
 	}
-
-	// Also load .attpignore if present.
-	ignorePatterns, err := loadAttpIgnore(root)
-	if err != nil {
-		return nil, fmt.Errorf("loading .attpignore: %w", err)
-	}
-	ignoreMatchers, err := compilePatterns(ignorePatterns)
-	if err != nil {
-		return nil, fmt.Errorf("compiling .attpignore patterns: %w", err)
-	}
-	matchers = append(matchers, ignoreMatchers...)
+	matchers := excluder.matchers
 
 	var entries []Entry
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -388,6 +378,55 @@ func nextPow2(n int) int {
 		p <<= 1
 	}
 	return p
+}
+
+// Excluder answers whether a repository-relative path is excluded by a set of
+// gitignore-style glob patterns. It is the single exclusion decision shared by
+// the Merkle tree builder and by anything that ships file content (the CLI's
+// pack command): a path the tree omits must never travel as a payload, and
+// keeping one matcher is what makes that a property rather than a habit.
+type Excluder struct {
+	matchers []glob.Glob
+}
+
+// NewExcluder compiles the given patterns. Blank lines and # comments are
+// ignored, as in .attpignore.
+func NewExcluder(patterns []string) (*Excluder, error) {
+	matchers, err := compilePatterns(patterns)
+	if err != nil {
+		return nil, fmt.Errorf("compiling patterns: %w", err)
+	}
+	return &Excluder{matchers: matchers}, nil
+}
+
+// NewExcluderForDir compiles the given patterns plus the .attpignore found in
+// root, if any. This is the pattern set BuildFromDir uses.
+func NewExcluderForDir(root string, patterns []string) (*Excluder, error) {
+	ignorePatterns, err := loadAttpIgnore(root)
+	if err != nil {
+		return nil, fmt.Errorf("loading .attpignore: %w", err)
+	}
+	ex, err := NewExcluder(patterns)
+	if err != nil {
+		return nil, err
+	}
+	ignoreMatchers, err := compilePatterns(ignorePatterns)
+	if err != nil {
+		return nil, fmt.Errorf("compiling .attpignore patterns: %w", err)
+	}
+	ex.matchers = append(ex.matchers, ignoreMatchers...)
+	return ex, nil
+}
+
+// Excluded reports whether relPath (relative to the tree root, any separator)
+// matches an exclusion pattern, by canonical path or by basename — the same
+// test the tree builder applies to every walked file.
+func (e *Excluder) Excluded(relPath string) bool {
+	if e == nil {
+		return false
+	}
+	canonical := canonicalPath(relPath)
+	return isExcluded(canonical, filepath.Base(canonical), e.matchers)
 }
 
 // compilePatterns compiles gitignore-style glob patterns.

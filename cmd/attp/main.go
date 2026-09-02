@@ -260,10 +260,18 @@ func cmdPack() error {
 		1,
 	)
 
-	// Add dirty files as payloads.
+	// Add dirty files as payloads — minus anything the exclusion patterns
+	// cover. The Merkle tree already omits those files; a payload that
+	// carried one anyway would ship the very content the token attests it
+	// withheld.
+	excluder, err := merkle.NewExcluderForDir(wd, excludePatterns)
+	if err != nil {
+		return fmt.Errorf("compiling exclusion patterns: %w", err)
+	}
+	shipped, withheld := selectPayloadPaths(dirtyPaths, excluder)
 	inlinedCount := 0
 	refCount := 0
-	for _, dp := range dirtyPaths {
+	for _, dp := range shipped {
 		content, err := os.ReadFile(dp)
 		if err != nil {
 			continue // skip files that can't be read (deleted, etc.)
@@ -293,9 +301,23 @@ func cmdPack() error {
 	fmt.Printf("Token packed: attp-token.json\n")
 	fmt.Printf("  repo:     %s @ %s (%s)\n", repoURL, branch, commit[:8])
 	fmt.Printf("  files:    %d in tree, %d excluded\n", len(tree.Leaves), len(excludePatterns))
-	fmt.Printf("  payloads: %d inlined, %d referenced\n", inlinedCount, refCount)
+	fmt.Printf("  payloads: %d inlined, %d referenced, %d withheld by exclusion\n", inlinedCount, refCount, len(withheld))
 	fmt.Printf("  merkle:   %s\n", merkleRoot[:16]+"...")
 	return nil
+}
+
+// selectPayloadPaths splits the dirty paths into those that may travel as
+// payloads and those the exclusion patterns withhold. Pure so it can be
+// tested without git, keys, or a working directory.
+func selectPayloadPaths(dirtyPaths []string, excluder *merkle.Excluder) (shipped, withheld []string) {
+	for _, dp := range dirtyPaths {
+		if excluder.Excluded(dp) {
+			withheld = append(withheld, dp)
+			continue
+		}
+		shipped = append(shipped, dp)
+	}
+	return shipped, withheld
 }
 
 func cmdUnpack() error {
